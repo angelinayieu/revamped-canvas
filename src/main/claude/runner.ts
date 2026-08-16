@@ -1,0 +1,334 @@
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  SDKMessage,
+  SDKAssistantMessage,
+  SDKUserMessage,
+  SDKResultMessage,
+  SDKPartialAssistantMessage,
+} from "@anthropic-ai/claude-agent-sdk";
+import { createRequire } from "node:module";
+import { dirname, join, sep } from "node:path";
+import { existsSync } from "node:fs";
+
+const nodeRequire = createRequire(import.meta.url);
+
+function resolveClaudeBin(): string | undefined {
+  const binName = process.platform === "win32" ? "claude.exe" : "claude";
+  const platformPkgShort = `claude-agent-sdk-${process.platform}-${process.arch}`;
+  const platformPkg = `@anthropic-ai/${platformPkgShort}`;
+  const candidates: string[] = [];
+
+  // 1. Packaged Electron: binary is unpacked next to app.asar.
+  if (process.resourcesPath) {
+    candidates.push(
+      join(
+        process.resourcesPath,
+        "app.asar.unpacked",
+        "node_modules",
+        "@anthropic-ai",
+        "claude-agent-sdk",
+        "node_modules",
+        "@anthropic-ai",
+        platformPkgShort,
+        binName,
+      ),
+      // Fallback: if it ever lands flat at top-level unpacked.
+      join(
+        process.resourcesPath,
+        "app.asar.unpacked",
+        "node_modules",
+        "@anthropic-ai",
+        platformPkgShort,
+        binName,
+      ),
+    );
+  }
+
+  // 2. Dev / hoisted install: resolve the SDK entry, then jump to the nested platform pkg.
+  try {
+    const sdkEntry = nodeRequire.resolve("@anthropic-ai/claude-agent-sdk");
+    const sdkDir = dirname(sdkEntry);
+    candidates.push(
+      join(sdkDir, "node_modules", "@anthropic-ai", platformPkgShort, binName),
+    );
+  } catch {
+    /* SDK unresolvable — shouldn't happen */
+  }
+
+  // 3. Top-level hoist (npm/yarn).
+  try {
+    const direct = nodeRequire.resolve(`${platformPkg}/package.json`);
+    candidates.push(join(dirname(direct), binName));
+  } catch {
+    /* not hoisted */
+  }
+
+  for (let candidate of candidates) {
+    const asarSeg = `${sep}app.asar${sep}`;
+    if (candidate.includes(asarSeg)) {
+      candidate = candidate.replace(asarSeg, `${sep}app.asar.unpacked${sep}`);
+    }
+    if (existsSync(candidate)) return candidate;
+  }
+  console.error("[lmcanvas] No claude binary found. Candidates tried:", candidates);
+  return undefined;
+}
+
+const CLAUDE_BIN_PATH = resolveClaudeBin();
+console.log("[lmcanvas] CLAUDE_BIN_PATH =", CLAUDE_BIN_PATH);
+import type {
+  BetaContentBlock,
+  BetaRawContentBlockDeltaEvent,
+  BetaTextDelta,
+  BetaThinkingDelta,
+  BetaToolUseBlock,
+  BetaTextBlock,
+  BetaThinkingBlock,
+} from "@anthropic-ai/sdk/resources/beta/messages/messages.mjs";
+import type {
+  ContentBlockParam,
+  ImageBlockParam,
+  TextBlockParam,
+  ToolResultBlockParam,
+} from "@anthropic-ai/sdk/resources/messages/messages.mjs";
+import type { WebContents } from "electron";
+import type { Attachment } from "@shared/ipc";
+import { buildAskUserServer } from "./askUserMcp";
+import { isAuthError, type RunnerEvent } from "../agents/types";
+
+const ASK_USER_SYSTEM_NOTE = `\n\nWhen you need to ask the local user a structured multiple-choice question, use the \`mcp__lmc__ask_user_question\` tool. It renders an interactive picker inside the local-lmcanvas app. Do NOT use the built-in AskUserQuestion tool — it is disabled in this environment.`;
+
+const DESIGN_PREVIEW_SYSTEM_NOTE = `
+
+# Live design previews (local-lmcanvas)
+
+This conversation runs inside local-lmcanvas — a branching canvas chat where any \`\`\`tsx fenced code block in your response renders as a LIVE INTERACTIVE PREVIEW inside the user's card (React 18 + Tailwind via CDN, sandboxed iframe). The user sees the rendered UI, not just the code.
+
+When the user is discussing UI or visual design — a layout, component, screen, page, interface, microsite, anything visual — DEMONSTRATE rather than describe. Emit a \`\`\`tsx block so they can SEE it. Don't write "Option A: a centered hero with a bold accent" and stop there — build Option A as a tsx block.
+
+When you have multiple design directions worth comparing, emit ONE tsx block per direction in the SAME response (give each a distinct PascalCase name like \`App\`, \`VariantB\`, \`VariantC\`). Each renders as its own preview in the card, stacked vertically — so the user can scan all options at once.
+
+If the user wants 3+ candidates generated as separate branches with distinct stylistic variations, point them at the "design fan-out" widget on the prompt input (visible when an image is attached): they pick N (2–6) and click "fork" to spawn N child cards in parallel.
+
+CONTRACT every \`\`\`tsx block MUST follow or the preview will show an error overlay:
+- One self-contained file. NO \`import\` statements. NO \`export\` statements.
+- Define exactly one top-level PascalCase function (or const) returning JSX. The LAST PascalCase declaration in the block is the one mounted, so put the entry component last.
+- Use ONLY Tailwind utility classes for styling. NO external libraries — no shadcn/ui, no lucide-react, no framer-motion, no other npm imports. For icons, write inline SVG or use Unicode glyphs. For images, use solid colors, gradients, or inline SVG placeholders (no external image URLs).
+- Real, plausible content matching the user's domain. No "Lorem ipsum".
+- Wrap the whole UI in a root \`<div>\` that sets the page background (e.g. \`min-h-screen bg-...\`).
+
+For conversations that aren't about visual design, behave normally — don't force tsx blocks where they don't fit.`;
+
+export type { RunnerEvent };
+
+export type RunClaudeOpts = {
+  cwd: string;
+  model?: string;
+  systemPrompt?: string;
+  attachments?: Attachment[];
+  signal?: AbortSignal;
+  webContents: WebContents;
+  nodeId: string;
+  onEvent: (ev: RunnerEvent) => void;
+};
+
+export async function runClaude(prompt: string, opts: RunClaudeOpts): Promise<void> {
+  const controller = new AbortController();
+  if (opts.signal) {
+    if (opts.signal.aborted) controller.abort();
+    else opts.signal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+
+  const seenToolUseIds = new Set<string>();
+  let doneEmitted = false;
+
+  const emit = (ev: RunnerEvent): void => {
+    if (ev.kind === "done") doneEmitted = true;
+    if (ev.kind === "error" && !ev.code && isAuthError(ev.message)) {
+      opts.onEvent({ ...ev, code: "auth_required" });
+      return;
+    }
+    if (ev.kind === "done" && ev.isError && !ev.code && isAuthError(ev.result ?? "")) {
+      opts.onEvent({ ...ev, code: "auth_required" });
+      return;
+    }
+    opts.onEvent(ev);
+  };
+
+  const attachments = opts.attachments ?? [];
+  // string-prompt path is preserved when there are no attachments so we don't
+  // change the working behaviour for plain-text chats. only images route through
+  // streaming-input.
+  const promptInput: string | AsyncIterable<SDKUserMessage> =
+    attachments.length > 0 ? buildStreamingPrompt(prompt, attachments) : prompt;
+
+  const askUserServer = buildAskUserServer(opts.webContents, opts.nodeId, controller.signal);
+  const appendedSystemPrompt =
+    (opts.systemPrompt ?? "") + ASK_USER_SYSTEM_NOTE + DESIGN_PREVIEW_SYSTEM_NOTE;
+
+  try {
+    const q = query({
+      prompt: promptInput,
+      options: {
+        cwd: opts.cwd,
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
+        model: opts.model,
+        pathToClaudeCodeExecutable: CLAUDE_BIN_PATH,
+        // append vs raw: we always extend claude_code preset so the agent
+        // keeps its built-in tooling instructions
+        systemPrompt: {
+          type: "preset",
+          preset: "claude_code",
+          append: appendedSystemPrompt,
+        },
+        includePartialMessages: true,
+        settingSources: ["user", "project"],
+        abortController: controller,
+        mcpServers: { lmc: askUserServer },
+        disallowedTools: ["AskUserQuestion"],
+      },
+    });
+
+    for await (const msg of q as AsyncIterable<SDKMessage>) {
+      handleMessage(msg, seenToolUseIds, emit);
+      if (msg.type === "result") {
+        break;
+      }
+    }
+  } catch (err: unknown) {
+    const message = errorMessage(err);
+    emit({ kind: "error", message });
+  } finally {
+    if (!doneEmitted) emit({ kind: "done", isError: false });
+  }
+}
+
+function handleMessage(
+  msg: SDKMessage,
+  seenToolUseIds: Set<string>,
+  emit: (ev: RunnerEvent) => void
+): void {
+  switch (msg.type) {
+    case "stream_event":
+      handleStreamEvent(msg, emit);
+      return;
+    case "assistant":
+      handleAssistant(msg, seenToolUseIds, emit);
+      return;
+    case "user":
+      handleUser(msg, emit);
+      return;
+    case "result":
+      handleResult(msg, emit);
+      return;
+    default:
+      return;
+  }
+}
+
+function handleStreamEvent(
+  msg: SDKPartialAssistantMessage,
+  emit: (ev: RunnerEvent) => void
+): void {
+  const event = msg.event;
+  if (event.type !== "content_block_delta") return;
+  const delta = (event as BetaRawContentBlockDeltaEvent).delta;
+  if (delta.type === "text_delta") {
+    emit({ kind: "text_delta", text: (delta as BetaTextDelta).text });
+  } else if (delta.type === "thinking_delta") {
+    emit({ kind: "thinking_delta", text: (delta as BetaThinkingDelta).thinking });
+  }
+}
+
+function handleAssistant(
+  msg: SDKAssistantMessage,
+  seenToolUseIds: Set<string>,
+  emit: (ev: RunnerEvent) => void
+): void {
+  const content = msg.message.content as BetaContentBlock[];
+  for (const block of content) {
+    if (block.type === "tool_use") {
+      const tu = block as BetaToolUseBlock;
+      if (seenToolUseIds.has(tu.id)) continue;
+      seenToolUseIds.add(tu.id);
+      emit({ kind: "tool_use", toolUseId: tu.id, name: tu.name, input: tu.input });
+    }
+    // text/thinking already arrived as deltas via stream_event
+    void (block as BetaTextBlock | BetaThinkingBlock);
+  }
+}
+
+function handleUser(msg: SDKUserMessage, emit: (ev: RunnerEvent) => void): void {
+  const content = msg.message.content;
+  if (typeof content === "string") return;
+  for (const block of content as ContentBlockParam[]) {
+    if (block.type !== "tool_result") continue;
+    const tr = block as ToolResultBlockParam;
+    emit({
+      kind: "tool_result",
+      toolUseId: tr.tool_use_id,
+      content: toolResultContentToString(tr.content),
+      isError: tr.is_error === true,
+    });
+  }
+}
+
+function handleResult(msg: SDKResultMessage, emit: (ev: RunnerEvent) => void): void {
+  if (msg.subtype === "success") {
+    emit({ kind: "done", isError: msg.is_error, result: msg.result });
+    return;
+  }
+  const errText = msg.errors && msg.errors.length ? msg.errors.join("\n") : msg.subtype;
+  emit({ kind: "done", isError: true, result: errText });
+}
+
+function toolResultContentToString(content: ToolResultBlockParam["content"]): string {
+  if (content === undefined) return "";
+  if (typeof content === "string") return content;
+  const parts: string[] = [];
+  for (const c of content) {
+    if (c.type === "text") {
+      parts.push(c.text);
+    } else {
+      // images / docs / search results aren't meaningful to render as plain text;
+      // surface a placeholder so the UI knows something was there
+      parts.push(`[${c.type}]`);
+    }
+  }
+  return parts.join("\n");
+}
+
+async function* buildStreamingPrompt(
+  text: string,
+  attachments: Attachment[]
+): AsyncIterable<SDKUserMessage> {
+  const content: ContentBlockParam[] = [];
+  if (text.length > 0) {
+    const tb: TextBlockParam = { type: "text", text };
+    content.push(tb);
+  }
+  for (const a of attachments) {
+    const ib: ImageBlockParam = {
+      type: "image",
+      source: { type: "base64", media_type: a.mediaType, data: a.base64 },
+    };
+    content.push(ib);
+  }
+  yield {
+    type: "user",
+    parent_tool_use_id: null,
+    message: { role: "user", content },
+  };
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return `Claude Code executable not found. Install Claude Code so the SDK can spawn it. (${err.message})`;
+    }
+    return err.message;
+  }
+  return String(err);
+}

@@ -1,0 +1,88 @@
+# local-lmcanvas
+
+A fully local, canvas-based branching AI conversation tool. Desktop Electron app that uses the **Claude Code CLI** (`claude -p --output-format stream-json`) as its LLM backend — no API keys, no cloud, no database.
+
+Each conversation is a tree of message nodes on a canvas. Branch from any node to fork the conversation history, or highlight text in a response to branch from that phrase. Everything persists to `~/.local-lmcanvas/`.
+
+## Prerequisites
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude` binary in `$PATH`)
+- [Bun](https://bun.sh) 1.1+
+- macOS / Linux / Windows
+
+Verify Claude Code works:
+
+```bash
+claude -p "say hi" --output-format stream-json --verbose | head
+```
+
+## Run
+
+```bash
+bun install
+bun run dev
+```
+
+The Electron window opens automatically. Build a distributable with:
+
+```bash
+bun run dist   # .dmg on macOS, .AppImage on Linux, .exe on Windows
+```
+
+## Architecture
+
+```
+src/
+├── main/           Electron main process (Node)
+│   ├── index.ts    IPC handlers, BrowserWindow setup
+│   ├── claude/     spawns `claude` CLI, parses stream-json
+│   └── storage/    reads/writes ~/.local-lmcanvas/
+├── preload/        contextBridge: exposes window.api to renderer
+├── renderer/       React UI (xyflow canvas, zustand store)
+└── shared/         types + graph logic used by both sides
+```
+
+All renderer → main calls go over IPC (`window.api.canvases.list()`, etc.) — no HTTP.
+
+## Storage
+
+```
+~/.local-lmcanvas/
+├── canvases/
+│   └── <id>.json        one file per canvas
+└── settings.json        system prompt, claude binary path, model
+```
+
+Files are human-readable JSON.
+
+## Keyboard shortcuts
+
+| key                    | action                             |
+| ---------------------- | ---------------------------------- |
+| `⌘+Enter`              | submit prompt in the focused input |
+| `⌘+B`                  | branch from the selected node      |
+| `Backspace` / `Delete` | delete the selected node           |
+| double-click empty pane | create a new root node            |
+
+## Troubleshooting
+
+**"claude binary not found"** — set the full path in Settings (gear icon), e.g. `/Users/you/.local/bin/claude`.
+
+**Blank window** — check the DevTools console (opens automatically in dev). For prod, `bun run dev` once to see errors.
+
+## Contributing
+
+PRs welcome — including AI/vibe-coded ones. See [CONTRIBUTING.md](./CONTRIBUTING.md) for dev setup, conventions, and how to file issues. AI agents should also read [AGENTS.md](./AGENTS.md).
+
+## Vision
+
+Local-first, canvas-native, bring-your-own-CLI. See [VISION.md](./VISION.md) for the longer take and [CHANGELOG.md](./CHANGELOG.md) for what's shipped.
+
+## Security
+
+Report vulnerabilities privately via [GitHub Security Advisories](https://github.com/max-lee-dev/local-lmcanvas/security/advisories/new). See [SECURITY.md](./SECURITY.md).
+
+## License
+
+[MIT](./LICENSE) © 2026 Max Lee
+

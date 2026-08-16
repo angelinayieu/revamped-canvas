@@ -1,0 +1,102 @@
+{
+  "name": "local-lmcanvas",
+  "version": "0.2.2",
+  "description": "Branching AI conversations via Claude Code CLI — fully local.",
+  "license": "MIT",
+  "author": "Max Lee",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/max-lee-dev/local-lmcanvas.git"
+  },
+  "homepage": "https://github.com/max-lee-dev/local-lmcanvas",
+  "bugs": {
+    "url": "https://github.com/max-lee-dev/local-lmcanvas/issues"
+  },
+  "main": "./out/main/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
+    "typecheck": "bun run typecheck:node && bun run typecheck:web",
+    "pack": "electron-vite build && electron-builder --dir",
+    "dist": "electron-vite build && electron-builder --publish never"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.141",
+    "@fontsource-variable/geist": "^5.2.8",
+    "@fontsource-variable/geist-mono": "^5.2.7",
+    "@xyflow/react": "^12.10.2",
+    "clsx": "^2.1.1",
+    "electron-updater": "^6.8.3",
+    "framer-motion": "^12.38.0",
+    "lucide-react": "^1.8.0",
+    "nanoid": "^5.1.9",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^42.1.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "tailwindcss": "^4.0.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  },
+  "build": {
+    "appId": "com.lmcanvas.local",
+    "productName": "LMCanvas",
+    "files": [
+      "out/**/*",
+      "package.json",
+      "node_modules/@anthropic-ai/**/*"
+    ],
+    "asarUnpack": [
+      "**/node_modules/@anthropic-ai/claude-agent-sdk-*/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": "resources"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": {
+        "target": "dmg",
+        "arch": [
+          "arm64",
+          "x64"
+        ]
+      },
+      "icon": "build/icon.png",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": true
+    },
+    "win": {
+      "icon": "build/icon.png"
+    },
+    "linux": {
+      "icon": "build/icon.png"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "max-lee-dev",
+      "repo": "local-lmcanvas"
+    }
+  }
+}
